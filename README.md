@@ -28,20 +28,36 @@ Or just download `index.html` and double-click it.
 5. Click **Download** to save your original workbook with a clean **Summary**
    tab added (Raw Data and Plate Map are preserved).
 
-### Expected input format
+### Supported input layouts (auto-detected)
 
-The workbook needs two sheets (names are matched loosely, e.g. "Raw Data",
-"Plate Map"):
+The tool detects which layout each workbook uses:
+
+**1. Raw Data + Plate Map grid**
 
 - **Raw Data** — an 8×12 plate grid of OD values (rows A–H, columns 1–12).
   `overflow` / saturated cells are recognized and excluded.
 - **Plate Map** — the matching 8×12 grid of well labels (e.g. `Standard 1`,
   `HQC`, `Blank`, `Unknown 12`), plus a small lookup table with columns
-  `Sample` and `Conc (pg/mL)` giving the nominal concentrations of the
-  standards and QCs.
+  `Sample` and `Conc (pg/mL)` giving the nominal concentrations. Replicates are
+  grouped by adjacency, so repeated labels in separate blocks (e.g. an HQC
+  bracket at each end of the plate) stay distinct.
 
-Replicates are grouped automatically by adjacency, so repeated labels placed in
-separate blocks (e.g. an HQC bracket at each end of the plate) stay distinct.
+**2. Pre-labeled section tables** (one or more plate/dilution sheets per file)
+
+Sheets containing labeled tables — `… Standard`, `… QC`, `Samples`, and/or
+inhibitor dose-response blocks — where each row already lists its concentration
+(or sample/inhibitor value) and OD replicates (2 or 3). No plate map needed.
+Per-sheet dilution is read from the sheet name (e.g. `1to100`, `1:10`) when
+present, otherwise from the dilution box. Starred outliers (`0.735*`) and
+`overflow` cells are excluded.
+
+Both PK concentration assays and **dose-response inhibition assays** are
+supported. For dose-response plates, the tool fits a 4PL per compound and
+reports **IC50** (`>max dose` when there is little/no inhibition over the tested
+range).
+
+Each analyzed sheet gets its own Summary tab appended to your original
+workbook; all original sheets are preserved.
 
 ## What it reports
 

@@ -67,16 +67,12 @@
   <div id="results">
     <div class="panel">
       <div class="dlrow">
-        <strong>Fit summary</strong>
-        <button id="downloadBtn" class="btn" disabled>⬇ Download summary (.xlsx)</button>
+        <strong id="resultSummary">Results</strong>
+        <button id="downloadBtn" class="btn" disabled>⬇ Download workbook (+ Summary tabs)</button>
       </div>
-      <div class="kpis" id="fit" style="margin-top:12px"></div>
-      <canvas id="curve" width="640" height="300"></canvas>
+      <div class="foot">Auto-detects two layouts: the Raw Data + Plate Map grid, or pre-labeled “… Standard / … QC / Samples / dose-response” tables. Each analyzed sheet gets its own Summary tab appended to your original workbook. Flags: overflow wells, OD above plateau, values beyond LLOQ/ULOQ, %CV &gt; 20%. Means, %CV and concentrations are live Excel formulas.</div>
     </div>
-    <div class="panel">
-      <div id="tables"></div>
-      <div class="foot">Flagged rows: overflow wells, OD above the curve plateau, sample values beyond LLOQ/ULOQ, or replicate %CV &gt; 20%. The downloaded workbook contains live Excel formulas (recalculate on open).</div>
-    </div>
+    <div id="sheets"></div>
   </div>
 </div>
 <script>
@@ -308,28 +304,53 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
     return p;
   }
 
-  function fit4PLrelative(concs, ods) {
-    var xs = concs.slice(), ys = ods.slice(), n = xs.length;
-    var ymin = Math.min.apply(null, ys), ymax = Math.max.apply(null, ys);
-    var pos = xs.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
-    var e0 = pos.length ? pos[Math.floor(pos.length / 2)] : 1;
-    var p = [Math.max(ymin, 1e-6), ymax * 1.1, e0, 1.0];
+  function _irls(xs, ys, p0) {
+    var n = xs.length, p = p0.slice();
     var w = ys.map(function (y) { return 1 / Math.pow(Math.max(y, 1e-9), 2); });
     for (var outer = 0; outer < 80; outer++) {
       var sw = w.map(Math.sqrt);
       var pNew = lm(xs, ys, sw, p);
-      var wNew = pNew.map ? xs.map(function (x) { return 1 / Math.pow(Math.max(fpl(pNew, x), 1e-9), 2); }) : w;
+      var wNew = xs.map(function (x) { return 1 / Math.pow(Math.max(fpl(pNew, x), 1e-9), 2); });
       var dp = 0, dw = 0;
       for (var i = 0; i < 4; i++) dp = Math.max(dp, Math.abs(pNew[i] - p[i]));
       for (i = 0; i < n; i++) dw = Math.max(dw, Math.abs(wNew[i] - w[i]) / w[i]);
       p = pNew; w = wNew;
       if (dp < 1e-10 && dw < 1e-10) break;
     }
-    // R^2
-    var ssRes = 0, ssTot = 0, ymean = ys.reduce(function (a, b) { return a + b; }, 0) / n;
+    var cost = 0;
+    for (var j = 0; j < n; j++) { var pr = fpl(p, xs[j]); cost += Math.pow((ys[j] - pr) / Math.max(Math.abs(pr), 1e-9), 2); }
+    return { p: p, w: w, cost: cost };
+  }
+
+  function fit4PLrelative(concs, ods) {
+    var xs = concs.slice(), ys = ods.slice(), n = xs.length;
+    var ymin = Math.min.apply(null, ys), ymax = Math.max.apply(null, ys);
+    var pos = xs.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
+    var lo = pos.length ? pos[0] : 1, hi = pos.length ? pos[pos.length - 1] : 1;
+    // multi-start over EC50 and Hill seeds; keep lowest relative-weighted cost
+    var e0seeds = [];
+    if (pos.length) {
+      var llo = Math.log10(lo), lhi = Math.log10(hi);
+      for (var s = 0; s <= 5; s++) e0seeds.push(Math.pow(10, llo + (lhi - llo) * s / 5));
+      e0seeds.push(pos[Math.floor(pos.length / 2)]);
+    } else { e0seeds = [1]; }
+    var hillSeeds = [0.7, 1.0, 1.5, 2.0];
+    var best = null;
+    for (var a = 0; a < e0seeds.length; a++) {
+      for (var b2 = 0; b2 < hillSeeds.length; b2++) {
+        var p0 = [Math.max(ymin, 1e-6), ymax * 1.1, e0seeds[a], hillSeeds[b2]];
+        var res;
+        try { res = _irls(xs, ys, p0); } catch (e) { continue; }
+        if (!isFinite(res.cost)) continue;
+        if (res.p[2] <= 0 || !isFinite(res.p[2])) continue;
+        if (!best || res.cost < best.cost) best = res;
+      }
+    }
+    if (!best) best = _irls(xs, ys, [Math.max(ymin, 1e-6), ymax * 1.1, (pos[Math.floor(pos.length/2)]||1), 1.0]);
+    var p = best.p, w = best.w;
+    var ssRes = 0, ssTot = 0, ymean = ys.reduce(function (a, b) { return a + b; }, 0) / n, i;
     for (i = 0; i < n; i++) { var pr = fpl(p, xs[i]); ssRes += Math.pow(ys[i] - pr, 2); ssTot += Math.pow(ys[i] - ymean, 2); }
     var r2 = ssTot > 0 ? 1 - ssRes / ssTot : NaN;
-    // weighted R^2
     var wSum = w.reduce(function (a, b) { return a + b; }, 0);
     var wYmean = 0; for (i = 0; i < n; i++) wYmean += w[i] * ys[i]; wYmean /= wSum;
     var wRes = 0, wTot = 0;
@@ -444,288 +465,512 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
   root.ElisaCore = api;
 })(typeof self !== "undefined" ? self : this);
 ;
+/* Multi */
+/* Section-table parsing + multi-format dispatch + IC50, for ELISA tool.
+   Depends on ElisaCore (fpl, fit4PLrelative, backCalc). Browser global + Node. */
+(function (root) {
+  "use strict";
+  var Core = (typeof require !== "undefined") ? require("./elisa_core.js") : root.ElisaCore;
+
+  function norm(v){ return v==null ? "" : String(v).replace(/\s+/g," ").trim(); }
+  function key(v){ return norm(v).toLowerCase().replace(/\s+/g,""); }
+  function num(v){
+    if (v==null) return null;
+    if (typeof v==="number") return v;
+    var s=String(v).trim();
+    if (s.indexOf("*")>=0) return null;
+    if (/overflow|over|^sat/i.test(s)) return null;
+    var f=parseFloat(s.replace(/,/g,""));
+    return isNaN(f)?null:f;
+  }
+  function isOverflowCell(v){ return typeof v==="string" && /overflow|over|^sat/i.test(v.trim()); }
+  function isStarred(v){ return typeof v==="string" && v.indexOf("*")>=0; }
+
+  function dilFromName(name){
+    var m = /1\s*[:to ]+\s*(\d+(?:\.\d+)?)/i.exec(name||"") || /(\d+(?:\.\d+)?)\s*x\b/i.exec(name||"");
+    return m ? parseFloat(m[1]) : null;
+  }
+
+  function parseSections(aoa){
+    var sections=[], analyte=null;
+    for (var r=0;r<aoa.length;r++){
+      var row=aoa[r]||[]; var keys=row.map(key);
+      var odCols=[];
+      for (var c=0;c<keys.length;c++) if (/^od\d+$/.test(keys[c])) odCols.push(c);
+      if (keys.indexOf("od1")<0) continue;
+      var headerRow=r, colA=keys[0], title="";
+      for (var t=r-1;t>=0 && t>=r-3;t--){ var tv=norm((aoa[t]||[])[0]); if (tv){ title=tv; break; } }
+      var type=null, compound=null;
+      if (colA.indexOf("inhibitor")===0 || keys.some(function(k){return k.indexOf("ic50")>=0;})) { type="ic50"; compound=title; }
+      else if (colA.indexOf("conc")===0){
+        if (/qc/i.test(title)) type="qc"; else type="standard";
+        var ma=/^(.*?)\s+(standard|qc)/i.exec(title); if (ma && !analyte) analyte=ma[1];
+      }
+      else if (colA.indexOf("sample")===0 || /sample/i.test(title)) type="sample";
+      else continue;
+      var rows=[];
+      for (var rr=headerRow+1; rr<aoa.length; rr++){
+        var dr=aoa[rr]||[]; var a=dr[0];
+        var odvals=odCols.map(function(ci){ var cell=dr[ci]; return {raw:cell, val:isStarred(cell)?null:num(cell), over:isOverflowCell(cell)}; });
+        var anyOd=odvals.some(function(o){return o.val!=null||o.over;});
+        if ((a==null||norm(a)==="") && !anyOd) break;
+        if (dr.map(key).indexOf("od1")>=0) break;
+        rows.push({a:a, ods:odvals});
+      }
+      sections.push({type:type, title:title, compound:compound, odCols:odCols, rows:rows, headerRow:headerRow, keys:keys});
+    }
+    return {sections:sections, analyte:analyte};
+  }
+
+  function meanCV(vals){
+    if (!vals.length) return {mean:null, cv:null};
+    var m=vals.reduce(function(a,b){return a+b;},0)/vals.length;
+    if (vals.length<2) return {mean:m, cv:null};
+    var s=0; vals.forEach(function(v){ s+=(v-m)*(v-m); });
+    return {mean:m, cv: m? Math.sqrt(s/(vals.length-1))/m*100 : null};
+  }
+
+  function flagFor(rec, params, lloq, uloq, kind){
+    var nOver=(rec.ods||[]).filter(function(o){return o.over;}).length;
+    if (nOver) return "Overflow well(s)";
+    if (!rec.valid || !rec.valid.length) return "No valid OD";
+    if (rec.meanOd>=params.top) return "OD above curve plateau";
+    if (rec.calc==null) return "Off curve (no interp.)";
+    if (kind==="unknown" && uloq!=null && rec.calc>uloq) return "> ULOQ (extrapolated)";
+    if (kind==="unknown" && lloq!=null && rec.calc<lloq) return "< LLOQ (extrapolated)";
+    if (rec.cv!=null && rec.cv>20) return "High %CV (>20%)";
+    return "";
+  }
+
+  /* Decreasing 4PL for inhibition: y = bottom + (top-bottom)/(1+(x/ic50)^hill). */
+  function dpl(p,x){ var b=p[0],t=p[1],ic=p[2],h=p[3]; var xx=x<=0?1e-12:x; return b+(t-b)/(1+Math.pow(xx/ic,h)); }
+  function solve(A,bb){ var n=bb.length,i,j,k; var M=A.map(function(rw,ix){return rw.slice().concat(bb[ix]);});
+    for(i=0;i<n;i++){var pv=i;for(k=i+1;k<n;k++)if(Math.abs(M[k][i])>Math.abs(M[pv][i]))pv=k;var tm=M[i];M[i]=M[pv];M[pv]=tm;if(Math.abs(M[i][i])<1e-300)M[i][i]=1e-300;for(k=i+1;k<n;k++){var f=M[k][i]/M[i][i];for(j=i;j<=n;j++)M[k][j]-=f*M[i][j];}}
+    var x=new Array(n);for(i=n-1;i>=0;i--){var s=M[i][n];for(j=i+1;j<n;j++)s-=M[i][j]*x[j];x[i]=s/M[i][i];}return x; }
+  function lmDec(xs,ys,p0){
+    var p=p0.slice(),n=xs.length,np=4,lambda=1e-3;
+    function resid(pp){var r=new Array(n);for(var i=0;i<n;i++)r[i]=ys[i]-dpl(pp,xs[i]);return r;}
+    function sse(r){var s=0;for(var i=0;i<n;i++)s+=r[i]*r[i];return s;}
+    var r=resid(p),cost=sse(r);
+    for(var it=0;it<200;it++){
+      var J=[];for(var i=0;i<n;i++)J.push(new Array(np));
+      for(var k=0;k<np;k++){var dp=Math.max(1e-9,Math.abs(p[k])*1e-6);var pa=p.slice();pa[k]+=dp;var pb=p.slice();pb[k]-=dp;var ra=resid(pa),rb=resid(pb);for(i=0;i<n;i++)J[i][k]=(ra[i]-rb[i])/(2*dp);}
+      var JtJ=[];for(i=0;i<np;i++)JtJ.push(new Array(np).fill(0));var Jtr=new Array(np).fill(0);
+      for(i=0;i<n;i++)for(var a=0;a<np;a++){Jtr[a]+=J[i][a]*r[i];for(var b2=0;b2<np;b2++)JtJ[a][b2]+=J[i][a]*J[i][b2];}
+      var improved=false;
+      for(var tr=0;tr<12;tr++){var Aa=JtJ.map(function(rw,ii){return rw.map(function(v,jj){return ii===jj?v*(1+lambda):v;});});var d;try{d=solve(Aa,Jtr);}catch(e){lambda*=10;continue;}
+        var pn=p.map(function(v,ii){return v-d[ii];}); if(pn[2]<=0)pn[2]=1e-6; if(pn[3]<=0)pn[3]=1e-6;
+        var rn=resid(pn),cn=sse(rn); if(cn<cost){var rel=(cost-cn)/Math.max(cost,1e-300);p=pn;r=rn;cost=cn;lambda=Math.max(lambda*0.5,1e-12);improved=true;if(rel<1e-12)it=1e9;break;}else lambda*=10;}
+      if(!improved)break;
+    }
+    return {p:p, cost:cost};
+  }
+  /* Fit IC50 from dose points [{x,y}] (x=inhibitor conc, y=response). */
+  function fitIC50(points){
+    var pts=points.filter(function(p){return p.x>0 && p.y!=null && isFinite(p.y);});
+    if (pts.length<4) return null;
+    var xs=pts.map(function(p){return p.x;}), ys=pts.map(function(p){return p.y;});
+    var ymin=Math.min.apply(null,ys), ymax=Math.max.apply(null,ys);
+    var sx=xs.slice().sort(function(a,b){return a-b;});
+    var seeds=[]; var lo=Math.log10(sx[0]), hi=Math.log10(sx[sx.length-1]);
+    for(var s=0;s<=6;s++) seeds.push(Math.pow(10,lo+(hi-lo)*s/6));
+    var best=null;
+    [0.7,1,1.5,2.5].forEach(function(h){ seeds.forEach(function(ic){
+      var res; try{ res=lmDec(xs,ys,[ymin,ymax,ic,h]); }catch(e){return;}
+      if(!isFinite(res.cost))return; if(!best||res.cost<best.cost)best=res;
+    });});
+    if(!best) return null;
+    var p=best.p;
+    var ssRes=best.cost, ymean=ys.reduce(function(a,b){return a+b;},0)/ys.length, ssTot=0;
+    ys.forEach(function(y){ssTot+=Math.pow(y-ymean,2);});
+    return {bottom:p[0], top:p[1], ic50:p[2], hill:p[3], r2: ssTot>0?1-ssRes/ssTot:NaN, xmax:sx[sx.length-1]};
+  }
+
+  function analyzeSheet(parsed, opts, sheetName){
+    var dil = dilFromName(sheetName) || opts.sampleDilution || 1;
+    var stdSec = parsed.sections.filter(function(s){return s.type==="standard";})[0];
+    if (!stdSec) return null;
+    var qcSec = parsed.sections.filter(function(s){return s.type==="qc";})[0];
+    var sampSecs = parsed.sections.filter(function(s){return s.type==="sample";});
+    var doseSecs = parsed.sections.filter(function(s){return s.type==="ic50";});
+
+    var concs=[], ods=[], standards=[];
+    stdSec.rows.forEach(function(row){
+      var nominal=num(row.a); if (nominal==null) return;
+      var vals=row.ods.filter(function(o){return o.val!=null;}).map(function(o){return o.val;});
+      var mc=meanCV(vals);
+      standards.push({nominal:nominal, ods:row.ods, valid:vals, meanOd:mc.mean, cv:mc.cv});
+      vals.forEach(function(v){ concs.push(nominal); ods.push(v); });
+    });
+    if (concs.length<4) return null;
+    var fit=Core.fit4PLrelative(concs,ods);
+    var nz=concs.filter(function(c){return c>0;});
+    var lloq=nz.length?Math.min.apply(null,nz):null, uloq=nz.length?Math.max.apply(null,nz):null;
+
+    function finish(rec){ rec.calc = rec.meanOd!=null?Core.backCalc(fit.params,rec.meanOd):null; rec.final = rec.calc!=null?rec.calc*dil:null; }
+    standards.forEach(function(rec){ finish(rec); rec.accuracy=(rec.nominal&&rec.calc!=null)?rec.calc/rec.nominal*100:null; rec.flag=flagFor(rec,fit.params,lloq,uloq,"standard"); });
+    var qcs=[];
+    if (qcSec) qcSec.rows.forEach(function(row){
+      var nominal=num(row.a); var vals=row.ods.filter(function(o){return o.val!=null;}).map(function(o){return o.val;});
+      var mc=meanCV(vals); var rec={nominal:nominal, ods:row.ods, valid:vals, meanOd:mc.mean, cv:mc.cv};
+      finish(rec); rec.accuracy=(nominal&&rec.calc!=null)?rec.calc/nominal*100:null; rec.flag=flagFor(rec,fit.params,lloq,uloq,"qc"); qcs.push(rec);
+    });
+    var samples=[];
+    sampSecs.forEach(function(sec){ sec.rows.forEach(function(row){
+      var id=norm(row.a); var vals=row.ods.filter(function(o){return o.val!=null;}).map(function(o){return o.val;});
+      var mc=meanCV(vals); var rec={label:id, ods:row.ods, valid:vals, meanOd:mc.mean, cv:mc.cv, kind:"unknown"};
+      finish(rec); rec.flag=flagFor(rec,fit.params,lloq,uloq,"unknown"); samples.push(rec);
+    });});
+
+    var compounds=[];
+    doseSecs.forEach(function(sec){
+      var rows=[], points=[];
+      sec.rows.forEach(function(row){
+        var x=num(row.a); var vals=row.ods.filter(function(o){return o.val!=null;}).map(function(o){return o.val;});
+        var mc=meanCV(vals); var calc=mc.mean!=null?Core.backCalc(fit.params,mc.mean):null;
+        var fin=calc!=null?calc*dil:null;
+        var rec={x:x, ods:row.ods, valid:vals, meanOd:mc.mean, cv:mc.cv, calc:calc, final:fin};
+        rows.push(rec);
+        if (x!=null && fin!=null) points.push({x:x, y:fin});
+      });
+      var icfit=fitIC50(points);
+      var display=null;
+      if (icfit){
+        if (!isFinite(icfit.ic50) || icfit.ic50>icfit.xmax) display=">"+icfit.xmax;
+        else if (icfit.ic50<0) display="<0";
+        else {
+          // require meaningful inhibition (>=~20% drop top->bottom)
+          var span=(icfit.top-icfit.bottom)/Math.max(Math.abs(icfit.top),1e-9);
+          display = span<0.2 ? ">"+icfit.xmax : icfit.ic50;
+        }
+      }
+      compounds.push({label:sec.title, rows:rows, fit:icfit, ic50:icfit?icfit.ic50:null, ic50Display:display});
+    });
+
+    samples.forEach(function(s){ s.reported = s.final; });
+    return { mode: (compounds.length?"doseresponse":"pk"), analyte:parsed.analyte, params:fit.params,
+             r2:fit.r2, wr2:fit.wr2, nStdPts:concs.length, lloq:lloq, uloq:uloq, dilution:dil,
+             standards:standards, qcs:qcs, samples:samples, compounds:compounds,
+             firstColLabel:"Sample ID", sampleConcLabel:"Final Conc (pg/mL)", reportedMult:dil };
+  }
+
+  /* Top-level: given a SheetJS workbook, return [{sheetName, analysis}] for each
+     analyzable sheet. Falls back to grid+platemap (ElisaCore.analyze) when a
+     Plate Map sheet is present. */
+  function analyzeWorkbook(XLSX, wb, opts){
+    var out=[];
+    var names=wb.SheetNames;
+    var aoaOf=function(n){ return XLSX.utils.sheet_to_json(wb.Sheets[n],{header:1,raw:true,defval:null}); };
+    var mapName=names.filter(function(n){return /map|plate ?map/i.test(n);})[0];
+    var rawName=names.filter(function(n){return /raw/i.test(n);})[0];
+    // grid mode if there is an explicit Plate Map sheet
+    if (mapName && rawName && Core.analyze){
+      try{
+        var A=Core.analyze(aoaOf(rawName), aoaOf(mapName), opts);
+        A.mode="pk"; A.gridMode=true;
+        A.samples=A.unknowns||[];
+        A.dilution=opts.sampleDilution||1;
+        var unit=opts.targetUnit||"ug/mL", upp=(opts.unitPerPg!=null?opts.unitPerPg:1e-6);
+        A.firstColLabel="Sample ID"; A.sampleConcLabel="Calc Conc ("+unit+")";
+        A.reportedMult=(opts.sampleDilution||1)*upp;
+        A.samples.forEach(function(s){ s.reported=s.calcUnit; });
+        A.compounds=A.compounds||[];
+        out.push({sheetName:"Summary", analysis:A});
+        return out;
+      }catch(e){ /* fall through to section parsing */ }
+    }
+    names.forEach(function(n){
+      var aoa; try{ aoa=aoaOf(n); }catch(e){ return; }
+      var parsed=parseSections(aoa);
+      if (!parsed.sections.some(function(s){return s.type==="standard";})) return;
+      var A; try{ A=analyzeSheet(parsed, opts, n); }catch(e){ return; }
+      if (A) out.push({sheetName:n, analysis:A});
+    });
+    return out;
+  }
+
+  var api={ parseSections:parseSections, analyzeSheet:analyzeSheet, analyzeWorkbook:analyzeWorkbook,
+            fitIC50:fitIC50, dpl:dpl, dilFromName:dilFromName, meanCV:meanCV, num:num };
+  if (typeof module!=="undefined" && module.exports) module.exports=api;
+  root.ElisaMulti=api;
+})(typeof self!=="undefined"?self:this);
+;
 /* Writer */
-/* Builds a clean Summary worksheet (SheetJS) and appends it to the original
-   uploaded workbook, preserving the Raw Data and Plate Map sheets.
-   Writes live Excel formulas with cached values. */
+/* Unified Summary writer (SheetJS). Handles PK and dose-response (IC50) analyses,
+   variable replicate counts, and appends one Summary tab per analyzed sheet. */
 (function (root) {
   "use strict";
   function colL(c){ var s=""; c++; while(c>0){var m=(c-1)%26; s=String.fromCharCode(65+m)+s; c=(c-m-1)/26;} return s; }
   function addr(r,c){ return colL(c)+(r+1); }
+  function absRef(a){ return a.replace(/([A-Z]+)(\d+)/, "$$$1$$$2"); }
+
+  function getOD(rec,k){
+    var o = rec.ods ? rec.ods[k] : undefined;
+    if (o && typeof o==="object") return {val:o.val, over:o.over};
+    var val = (o==null)?null:o;
+    var over = rec.raw && rec.raw[k]!=null && /over/i.test(String(rec.raw[k]));
+    return {val:val, over:over};
+  }
+  function nrepOf(recs){ var n=2; recs.forEach(function(r){ if(r.ods) n=Math.max(n,r.ods.length); }); return Math.min(n,3); }
 
   function makeSummarySheet(XLSX, A, sourceName){
-    var cells = {}, maxC = 7, maxR = 0;
-    function put(r,c,v,opts){
-      opts=opts||{};
-      var cell={};
-      if(opts.f){ cell.t='n'; cell.f=opts.f; if(v!=null && !isNaN(v)) cell.v=v; }
-      else if(typeof v==='number'){ cell.t='n'; cell.v=v; }
-      else if(v==null || v===''){ return; }
-      else { cell.t='s'; cell.v=String(v); }
-      if(opts.z) cell.z=opts.z;
-      cells[addr(r,c)]=cell; if(c>maxC)maxC=c; if(r>maxR)maxR=r;
-    }
-    var merges=[];
-    function mergeRow(r, c1, c2){ merges.push({s:{r:r,c:c1}, e:{r:r,c:c2}}); }
+    var cells={}, maxC=7, maxR=0, merges=[];
+    function put(r,c,v,opts){ opts=opts||{}; var cell={};
+      if(opts.f){cell.t='n';cell.f=opts.f; if(v!=null&&!isNaN(v))cell.v=v;}
+      else if(typeof v==='number'){cell.t='n';cell.v=v;}
+      else if(v==null||v===''){return;} else {cell.t='s';cell.v=String(v);}
+      if(opts.z)cell.z=opts.z; cells[addr(r,c)]=cell; if(c>maxC)maxC=c; if(r>maxR)maxR=r; }
+    function mrow(r,c1,c2){ merges.push({s:{r:r,c:c1},e:{r:r,c:c2}}); }
 
     var r=0;
-    // ---- title block ----
-    put(r,0,"ELISA 4PL Analysis Summary"); mergeRow(r,0,7); r++;
-    put(r,0,"Source file"); put(r,1, sourceName||""); mergeRow(r,1,7); r++;
-    put(r,0,"Fit model"); put(r,1,"Sigmoidal 4PL, 1/Y² weighting (GraphPad Prism-equivalent)"); mergeRow(r,1,7); r++;
-    r++; // blank
+    put(r,0,"ELISA 4PL Analysis Summary"); mrow(r,0,7); r++;
+    put(r,0,"Source file"); put(r,1,sourceName||""); mrow(r,1,7); r++;
+    if (A.analyte){ put(r,0,"Analyte"); put(r,1,A.analyte); mrow(r,1,7); r++; }
+    put(r,0,"Fit model"); put(r,1,"Sigmoidal 4PL, 1/Y² weighting (Prism-equivalent)"); mrow(r,1,7); r++;
+    r++;
 
-    // ---- fit parameters (clean 2-col table) ----
-    put(r,0,"STANDARD CURVE FIT"); mergeRow(r,0,7); r++;
+    put(r,0,"STANDARD CURVE FIT"); mrow(r,0,7); r++;
     put(r,0,"Parameter"); put(r,1,"Value"); r++;
-    var refRow={};
-    function param(name, val, z){ put(r,0,name); put(r,1,val,{z:z}); refRow[name]=addr(r,1); r++; }
-    param("Bottom (OD)", A.params.bottom, "0.000");
-    param("Top (OD)", A.params.top, "0.000");
-    param("EC50 (pg/mL)", A.params.ec50, "0.0");
-    param("Hill slope", A.params.hill, "0.000");
-    param("R²", A.r2, "0.0000");
-    param("Standard points used", A.nStdPts, "0");
-    param("LLOQ (pg/mL)", A.lloq, "0.###");
-    param("ULOQ (pg/mL)", A.uloq, "0.###");
-    var BOT=fix(refRow["Bottom (OD)"]), TOP=fix(refRow["Top (OD)"]),
-        EC=fix(refRow["EC50 (pg/mL)"]), HILL=fix(refRow["Hill slope"]);
-    function fix(a){ return a.replace(/([A-Z]+)(\d+)/, "$$$1$$$2"); }
+    var ref={};
+    function param(name,val,z){ put(r,0,name); put(r,1,val,{z:z}); ref[name]=addr(r,1); r++; }
+    param("Bottom (OD)",A.params.bottom,"0.000");
+    param("Top (OD)",A.params.top,"0.0000");
+    param("EC50 (pg/mL)",A.params.ec50,"0.00");
+    param("Hill slope",A.params.hill,"0.000");
+    param("R²",A.r2,"0.0000");
+    param("Std points used",A.nStdPts,"0");
+    param("LLOQ (pg/mL)",A.lloq,"0.###");
+    param("ULOQ (pg/mL)",A.uloq,"0.###");
+    if (A.dilution && A.dilution!==1) param("Sample dilution ×",A.dilution,"0.###");
+    var BOT=absRef(ref["Bottom (OD)"]),TOP=absRef(ref["Top (OD)"]),EC=absRef(ref["EC50 (pg/mL)"]),HILL=absRef(ref["Hill slope"]);
     function bc(od){ return 'IF(OR('+od+'="",'+od+'<='+BOT+','+od+'>='+TOP+'),"",'+EC+'*(('+TOP+'-'+BOT+')/('+od+'-'+BOT+')-1)^(-1/'+HILL+'))'; }
-    r++; // blank
+    r++;
 
-    function block(title, recs, mode){
-      put(r,0,title); mergeRow(r,0,7); r++;
-      var heads = mode==='sample'
-        ? ["Sample ID","OD 1","OD 2","Mean OD","%CV","Conc (pg/mL)","Conc ("+A.targetUnit+")","Flag"]
-        : ["Nominal (pg/mL)","OD 1","OD 2","Mean OD","%CV","Calc (pg/mL)","Accuracy (%)","Flag"];
+    function odBlock(title, recs, mode, nrep){
+      put(r,0,title); mrow(r,0,7); r++;
+      var heads;
+      var odh=[]; for(var k=0;k<nrep;k++) odh.push("OD "+(k+1));
+      if(mode==="sample") heads=[A.firstColLabel||"Sample ID"].concat(odh, ["Mean OD","%CV","Calc (pg/mL)", A.sampleConcLabel||"Final Conc", "Flag"]);
+      else if(mode==="dose") heads=["Inhibitor (nM)"].concat(odh, ["Mean OD","%CV","Calc (pg/mL)","Final (pg/mL)"]);
+      else heads=["Nominal (pg/mL)"].concat(odh, ["Mean OD","%CV","Calc (pg/mL)","Accuracy (%)","Flag"]);
       heads.forEach(function(h,j){ put(r,j,h); }); r++;
       recs.forEach(function(rec){
-        var ncol=Math.max(2,rec.ods.length);
-        for(var k=0;k<ncol;k++){
-          var v=rec.ods[k];
-          if(v!=null) put(r,1+k,v,{z:'0.000'});
-          else if(rec.raw[k]!=null && /over/i.test(String(rec.raw[k]))) put(r,1+k,"OVR");
+        var cells_od=[];
+        for(var k=0;k<nrep;k++){ var o=getOD(rec,k); var disp = o.val!=null?o.val:(o.over?"OVR":null); var cc=put(r,1+k,disp,{z:'0.000'}); cells_od.push(addr(r,1+k)); }
+        var rng=cells_od[0]+":"+cells_od[cells_od.length-1];
+        if(mode==="sample") put(r,0,rec.label); else put(r,0,rec.nominal!=null?rec.nominal:rec.x,{z:'0.###'});
+        var meanCol=1+nrep, cvCol=2+nrep, calcCol=3+nrep, lastCol=4+nrep, flagCol=5+nrep;
+        put(r,meanCol, rec.meanOd, {f:'IFERROR(AVERAGE('+rng+'),"")', z:'0.000'});
+        put(r,cvCol, rec.cv, {f:'IFERROR(STDEV('+rng+')/AVERAGE('+rng+')*100,"")', z:'0.0'});
+        var avgA=addr(r,meanCol), Fc=addr(r,calcCol);
+        put(r,calcCol, rec.calc, {f:bc(avgA), z:'0.0'});
+        if(mode==="sample"){
+          var rep = (rec.reported!=null?rec.reported:rec.final);
+          var mult = (A.reportedMult!=null?A.reportedMult:(A.dilution||1));
+          put(r,lastCol, rep, {f:'IF('+Fc+'="","",'+Fc+'*'+mult+')', z:'0.000'});
+          if(rec.flag) put(r,flagCol, rec.flag);
+        } else if(mode==="dose"){
+          put(r,lastCol, rec.final, {f:'IF('+Fc+'="","",'+Fc+'*'+(A.dilution||1)+')', z:'0.0'});
+        } else {
+          if(rec.nominal) put(r,lastCol, rec.accuracy, {f:'IF(OR('+Fc+'="",'+rec.nominal+'=0),"",'+Fc+'/'+rec.nominal+'*100)', z:'0.0'});
+          else put(r,lastCol,"NA");
+          if(rec.flag) put(r,flagCol, rec.flag);
         }
-        var first=addr(r,1), last=addr(r,1+ncol-1), rng=first+":"+last;
-        if(mode==='sample') put(r,0,rec.label); else put(r,0,rec.nominal,{z:'0.###'});
-        put(r,3, rec.meanOd, {f:'IFERROR(AVERAGE('+rng+'),"")', z:'0.000'});
-        put(r,4, rec.cv, {f:'IFERROR(STDEV('+rng+')/AVERAGE('+rng+')*100,"")', z:'0.0'});
-        var avgCell=addr(r,3), Fc=addr(r,5);
-        put(r,5, rec.calc, {f:bc(avgCell), z:'0.0'});
-        if(mode==='sample'){
-          put(r,6, rec.calcUnit, {f:'IF('+Fc+'="","",'+Fc+'*'+A.sampleDilution+'*'+A.unitPerPg+')', z:'0.000'});
-        } else if(rec.nominal){
-          put(r,6, rec.accuracy, {f:'IF(OR('+Fc+'="",'+rec.nominal+'=0),"",'+Fc+'/'+rec.nominal+'*100)', z:'0.0'});
-        } else put(r,6,"NA");
-        if(rec.flag) put(r,7, rec.flag);
         r++;
       });
-      r++; // blank between blocks
+      r++;
     }
-    block("STANDARD CURVE", A.standards, "standard");
-    if(A.qcs.length) block("QUALITY CONTROLS", A.qcs, "standard");
-    block("SAMPLES", A.unknowns, "sample");
 
-    // ---- concise notes ----
-    put(r,0,"Notes"); mergeRow(r,0,7); r++;
-    var dilNote = "Sample conc ("+A.targetUnit+") = back-calculated pg/mL × dilution "+A.sampleDilution+" ÷ "+(1/A.unitPerPg).toLocaleString()+".";
-    [dilNote,
-     "Overflow wells excluded from means and flagged; values beyond LLOQ/ULOQ are extrapolated.",
-     "Means, %CV, concentrations and accuracy are live formulas (recalculate in Excel)."
-    ].forEach(function(n){ put(r,0,n); mergeRow(r,0,7); r++; });
+    odBlock("STANDARD CURVE", A.standards, "standard", nrepOf(A.standards));
+    if (A.qcs && A.qcs.length) odBlock("QUALITY CONTROLS", A.qcs, "standard", nrepOf(A.qcs));
+    if (A.samples && A.samples.length) odBlock("SAMPLES", A.samples, "sample", nrepOf(A.samples));
 
-    var ws={};
-    Object.keys(cells).forEach(function(a){ ws[a]=cells[a]; });
+    if (A.compounds && A.compounds.length){
+      put(r,0,"IC50 SUMMARY"); mrow(r,0,7); r++;
+      put(r,0,"Compound"); put(r,1,"IC50 (nM)"); put(r,2,"Hill"); put(r,3,"Curve R²"); r++;
+      A.compounds.forEach(function(c){
+        put(r,0,c.label);
+        put(r,1, typeof c.ic50Display==="number"?c.ic50Display:(c.ic50Display||"NA"), {z:'0.00'});
+        if(c.fit){ put(r,2,c.fit.hill,{z:'0.00'}); put(r,3,c.fit.r2,{z:'0.000'}); }
+        r++;
+      });
+      r++;
+      A.compounds.forEach(function(c){
+        var title="DOSE–RESPONSE: "+c.label+(typeof c.ic50Display==="number"?("  (IC50 "+c.ic50Display.toFixed(2)+" nM)"):("  (IC50 "+(c.ic50Display||"NA")+")"));
+        odBlock(title, c.rows.map(function(row){ return {x:row.x, ods:row.ods, meanOd:row.meanOd, cv:row.cv, calc:row.calc, final:row.final}; }), "dose", nrepOf(c.rows));
+      });
+    }
+
+    put(r,0,"Notes"); mrow(r,0,7); r++;
+    var notes=[
+      "Means, %CV, concentrations and accuracy are live Excel formulas (recalculate on open).",
+      "Overflow / starred wells are excluded from means and flagged.",
+      A.compounds && A.compounds.length ? "IC50 fitted by 4PL on dose vs back-calculated response; '>max' = no/low inhibition over tested range." :
+        "Final Conc = back-calculated pg/mL × dilution; values beyond LLOQ/ULOQ are extrapolated."
+    ];
+    notes.forEach(function(n){ put(r,0,n); mrow(r,0,7); r++; });
+
+    var ws={}; Object.keys(cells).forEach(function(a){ ws[a]=cells[a]; });
     ws['!ref']=XLSX.utils.encode_range({s:{r:0,c:0},e:{r:maxR+1,c:Math.max(maxC,7)}});
-    ws['!cols']=[{wch:20},{wch:10},{wch:10},{wch:11},{wch:8},{wch:15},{wch:16},{wch:22}];
+    ws['!cols']=[{wch:22},{wch:9},{wch:9},{wch:9},{wch:11},{wch:8},{wch:15},{wch:16},{wch:20}];
     ws['!merges']=merges;
     return ws;
   }
 
-  /* Append/replace a "Summary" sheet on the original workbook, first. */
-  function appendSummary(XLSX, wb, A, sourceName){
-    var ws = makeSummarySheet(XLSX, A, sourceName);
-    var name = "Summary";
-    if(wb.SheetNames.indexOf(name) >= 0){ delete wb.Sheets[name]; wb.SheetNames = wb.SheetNames.filter(function(n){return n!==name;}); }
-    wb.Sheets[name] = ws;
-    wb.SheetNames.push(name); // add as last tab, after Raw Data + Plate Map
+  function sanitizeName(n){ return String(n).replace(/[\\\/\?\*\[\]:]/g,' ').slice(0,24); }
+
+  /* analyses: [{sheetName, analysis}]. Appends one Summary tab per analysis. */
+  function appendSummaries(XLSX, wb, analyses, sourceName){
+    analyses.forEach(function(item){
+      var base = item.analysis.gridMode ? "Summary" : sanitizeName(item.sheetName+" Summary");
+      var name = base, i=2;
+      while (wb.SheetNames.indexOf(name)>=0 && !/Summary$/.test(item.sheetName)){ name = sanitizeName(base+" "+i); i++; }
+      if (wb.SheetNames.indexOf(name)>=0){ delete wb.Sheets[name]; wb.SheetNames=wb.SheetNames.filter(function(x){return x!==name;}); }
+      wb.Sheets[name]=makeSummarySheet(XLSX, item.analysis, sourceName);
+      wb.SheetNames.push(name);
+    });
     return wb;
   }
 
-  /* Standalone summary-only workbook (kept for compatibility). */
-  function buildSummaryWorkbook(XLSX, A, sourceName){
-    var wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, makeSummarySheet(XLSX, A, sourceName), "Summary");
-    return wb;
-  }
-
-  var api={ makeSummarySheet:makeSummarySheet, appendSummary:appendSummary, buildSummaryWorkbook:buildSummaryWorkbook };
-  if (typeof module !== "undefined" && module.exports) module.exports = api;
-  root.ElisaWriter = api;
-})(typeof self !== "undefined" ? self : this);
+  var api={ makeSummarySheet:makeSummarySheet, appendSummaries:appendSummaries };
+  if (typeof module!=="undefined" && module.exports) module.exports=api;
+  root.ElisaWriter=api;
+})(typeof self!=="undefined"?self:this);
 ;
 /* App */
 (function(){
   "use strict";
-  var XLSX = window.XLSX, Core = window.ElisaCore, Writer = window.ElisaWriter;
-  var lastAnalysis=null, lastName="ELISA";
-  var rawAOA=null, mapAOA=null, originalWB=null;
+  var XLSX=window.XLSX, Core=window.ElisaCore, Multi=window.ElisaMulti, Writer=window.ElisaWriter;
+  var originalWB=null, analyses=[], lastName="ELISA";
 
   function $(id){ return document.getElementById(id); }
   function fmt(v,d){ return (v==null||isNaN(v))?"":Number(v).toFixed(d==null?2:d); }
-
-  function readWorkbook(fileBuf){
-    var wb = XLSX.read(fileBuf,{type:'array'});
-    var rawName = wb.SheetNames.filter(function(n){return /raw/i.test(n);})[0];
-    var mapName = wb.SheetNames.filter(function(n){return /map|plate/i.test(n);})[0];
-    if(!rawName || !mapName) throw new Error("The file needs a sheet named like 'Raw Data' and one like 'Plate Map'. Found: "+wb.SheetNames.join(", "));
-    function aoa(n){ return XLSX.utils.sheet_to_json(wb.Sheets[n],{header:1,raw:true,defval:null}); }
-    return { raw: aoa(rawName), map: aoa(mapName), wb: wb };
-  }
+  function esc(s){ return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}); }
+  function getOD(rec,k){ var o=rec.ods?rec.ods[k]:undefined;
+    if(o&&typeof o==="object") return {val:o.val,over:o.over};
+    var over=rec.raw&&rec.raw[k]!=null&&/over/i.test(String(rec.raw[k])); return {val:(o==null?null:o),over:over}; }
+  function nrepOf(recs){ var n=2; recs.forEach(function(r){ if(r.ods)n=Math.max(n,r.ods.length); }); return Math.min(n,3); }
 
   function opts(){
-    var unitSel = $('unit').value; // value encodes "label|perpg"
-    var parts = unitSel.split('|');
-    return { sampleDilution: parseFloat($('dil').value)||1, targetUnit: parts[0], unitPerPg: parseFloat(parts[1]) };
+    var parts=$('unit').value.split('|');
+    return { sampleDilution: parseFloat($('dil').value)||1, targetUnit:parts[0], unitPerPg:parseFloat(parts[1]) };
   }
 
   function run(){
-    if(!rawAOA||!mapAOA) return;
+    if(!originalWB) return;
     try{
-      lastAnalysis = Core.analyze(rawAOA, mapAOA, opts());
+      analyses=Multi.analyzeWorkbook(XLSX, originalWB, opts());
+      if(!analyses.length) throw new Error("No analyzable plate found. Need a standard-curve table (e.g. 'X Standard' with Conc + OD columns) or a Raw Data + Plate Map grid.");
       $('error').style.display='none';
-      render(lastAnalysis);
+      render();
       $('results').style.display='block';
       $('downloadBtn').disabled=false;
     }catch(e){
-      $('error').textContent = "⚠ "+e.message;
-      $('error').style.display='block';
-      $('results').style.display='none';
-      $('downloadBtn').disabled=true;
+      $('error').textContent="⚠ "+e.message; $('error').style.display='block';
+      $('results').style.display='none'; $('downloadBtn').disabled=true;
     }
   }
 
   function handleFile(file){
-    lastName = file.name.replace(/\.xlsx?$/i,'');
-    var reader = new FileReader();
-    reader.onload = function(e){
-      try{
-        var data = new Uint8Array(e.target.result);
-        var parsed = readWorkbook(data);
-        rawAOA = parsed.raw; mapAOA = parsed.map; originalWB = parsed.wb;
-        $('fileLabel').textContent = file.name;
-        run();
-      }catch(err){
-        $('error').textContent = "⚠ "+err.message;
-        $('error').style.display='block';
-        $('results').style.display='none';
-      }
+    lastName=file.name.replace(/\.xlsx?$/i,'');
+    var reader=new FileReader();
+    reader.onload=function(e){
+      try{ originalWB=XLSX.read(new Uint8Array(e.target.result),{type:'array'}); $('fileLabel').textContent=file.name; run(); }
+      catch(err){ $('error').textContent="⚠ "+err.message; $('error').style.display='block'; $('results').style.display='none'; }
     };
     reader.readAsArrayBuffer(file);
   }
 
-  function tableBlock(title, recs, mode, A){
-    var heads = mode==='sample'
-      ? ["Sample ID","OD1","OD2","Avg OD","%CV","Calc (pg/mL)","Calc ("+A.targetUnit+")","Flag"]
-      : ["Nominal (pg/mL)","OD1","OD2","Avg OD","%CV","Calc (pg/mL)","Accuracy %","Flag"];
-    var h = "<h3>"+title+"</h3><div class='tablewrap'><table><thead><tr>";
-    heads.forEach(function(x){ h+="<th>"+x+"</th>"; });
-    h+="</tr></thead><tbody>";
+  function kpi(k,v){ return "<div class='kpi'><div class='kpi-v'>"+v+"</div><div class='kpi-k'>"+k+"</div></div>"; }
+
+  function odTable(recs, mode, A){
+    var nrep=nrepOf(recs), odh=""; for(var k=0;k<nrep;k++) odh+="<th>OD "+(k+1)+"</th>";
+    var heads;
+    if(mode==="sample") heads="<th>"+(A.firstColLabel||"Sample ID")+"</th>"+odh+"<th>Mean</th><th>%CV</th><th>Calc (pg/mL)</th><th>"+(A.sampleConcLabel||"Final")+"</th><th>Flag</th>";
+    else if(mode==="dose") heads="<th>Inhibitor (nM)</th>"+odh+"<th>Mean</th><th>%CV</th><th>Calc (pg/mL)</th><th>Final (pg/mL)</th>";
+    else heads="<th>Nominal (pg/mL)</th>"+odh+"<th>Mean</th><th>%CV</th><th>Calc (pg/mL)</th><th>Accuracy %</th><th>Flag</th>";
+    var h="<div class='tablewrap'><table><thead><tr>"+heads+"</tr></thead><tbody>";
     recs.forEach(function(r){
-      var od1 = r.ods[0]!=null?fmt(r.ods[0],3):(r.raw[0]!=null&&/over/i.test(String(r.raw[0]))?"OVR":"");
-      var od2 = r.ods[1]!=null?fmt(r.ods[1],3):(r.raw[1]!=null&&/over/i.test(String(r.raw[1]))?"OVR":"");
-      var c7 = mode==='sample' ? (r.calcUnit!=null?fmt(r.calcUnit,3):"") : (r.accuracy!=null?fmt(r.accuracy,1):(r.nominal?"":"NA"));
-      var cls = r.flag? " class='flagged'":"";
-      h+="<tr"+cls+"><td class='lab'>"+(mode==='sample'?r.label:fmt(r.nominal,4))+"</td>"
-        +"<td>"+od1+"</td><td>"+od2+"</td>"
-        +"<td>"+(r.meanOd!=null?fmt(r.meanOd,3):"")+"</td>"
-        +"<td>"+(r.cv!=null?fmt(r.cv,1):"")+"</td>"
-        +"<td>"+(r.calc!=null?fmt(r.calc,1):"")+"</td>"
-        +"<td>"+c7+"</td>"
-        +"<td class='flag'>"+(r.flag||"")+"</td></tr>";
+      var od=""; for(var k=0;k<nrep;k++){ var o=getOD(r,k); od+="<td>"+(o.val!=null?fmt(o.val,3):(o.over?"OVR":""))+"</td>"; }
+      var first = mode==="sample"?esc(r.label):(mode==="dose"?fmt(r.x,3):fmt(r.nominal,4));
+      var last, flag="";
+      if(mode==="sample"){ last=fmt(r.reported!=null?r.reported:r.final,3); flag=r.flag||""; }
+      else if(mode==="dose"){ last=fmt(r.final,1); }
+      else { last=(r.nominal?fmt(r.accuracy,1):"NA"); flag=r.flag||""; }
+      var cls=flag?" class='flagged'":"";
+      h+="<tr"+cls+"><td class='lab'>"+first+"</td>"+od+"<td>"+fmt(r.meanOd,3)+"</td><td>"+fmt(r.cv,1)+"</td><td>"+(r.calc!=null?fmt(r.calc,1):"")+"</td><td>"+last+"</td>"+(mode==="dose"?"":"<td class='flag'>"+esc(flag)+"</td>")+"</tr>";
     });
-    h+="</tbody></table></div>";
-    return h;
+    return h+"</tbody></table></div>";
   }
 
-  function render(A){
-    var p=A.params;
-    $('fit').innerHTML =
-      card("EC50 (pg/mL)", fmt(p.ec50,1)) + card("Hill slope", fmt(p.hill,3)) +
-      card("Top", fmt(p.top,3)) + card("Bottom", fmt(p.bottom,3)) +
-      card("R²", fmt(A.r2,4)) + card("LLOQ–ULOQ", fmt(A.lloq,1)+" – "+fmt(A.uloq,0)) ;
-    $('tables').innerHTML =
-      tableBlock("Standard Curve", A.standards, "standard", A) +
-      (A.qcs.length? tableBlock("Quality Controls", A.qcs, "standard", A):"") +
-      tableBlock("Samples", A.unknowns, "sample", A);
-    drawCurve(A);
-  }
-  function card(k,v){ return "<div class='kpi'><div class='kpi-v'>"+v+"</div><div class='kpi-k'>"+k+"</div></div>"; }
-
-  function drawCurve(A){
-    var cv=$('curve'); if(!cv) return; var ctx=cv.getContext('2d'); if(!ctx) return;
-    var W=cv.width, H=cv.height, padL=58, padB=38, padT=14, padR=14;
+  function drawCurve(canvas, A){
+    if(!canvas) return; var ctx=canvas.getContext('2d'); if(!ctx) return;
+    var W=canvas.width,H=canvas.height,padL=58,padB=38,padT=12,padR=14;
     ctx.clearRect(0,0,W,H);
-    var stds = A.standards.filter(function(r){return r.kind==='standard' && r.nominal>0 && r.meanOd!=null;});
+    var stds=A.standards.filter(function(r){return r.nominal>0 && r.meanOd!=null;});
     if(!stds.length) return;
-    var xs = stds.map(function(r){return Math.log10(r.nominal);});
-    var xmin=Math.min.apply(null,xs), xmax=Math.max.apply(null,xs);
-    var ymax=Math.max(A.params.top*1.05, Math.max.apply(null, stds.map(function(r){return r.meanOd;}))*1.05);
-    var ymin=0;
-    function X(lx){ return padL+(lx-xmin)/(xmax-xmin)*(W-padL-padR); }
-    function Y(y){ return H-padB-(y-ymin)/(ymax-ymin)*(H-padT-padB); }
-    // axes
-    ctx.strokeStyle="#cbd5e1"; ctx.lineWidth=1; ctx.beginPath();
-    ctx.moveTo(padL,padT); ctx.lineTo(padL,H-padB); ctx.lineTo(W-padR,H-padB); ctx.stroke();
-    ctx.fillStyle="#64748b"; ctx.font="11px system-ui";
-    // x ticks at each decade within range
-    for(var d=Math.floor(xmin); d<=Math.ceil(xmax); d++){
-      var px=X(d); if(px<padL-1||px>W-padR+1) continue;
-      ctx.strokeStyle="#eef2f7"; ctx.beginPath(); ctx.moveTo(px,padT); ctx.lineTo(px,H-padB); ctx.stroke();
-      ctx.fillStyle="#94a3b8"; ctx.fillText(Math.pow(10,d).toLocaleString(), px-10, H-padB+14);
-    }
-    for(var t=0;t<=4;t++){ var yy=ymin+(ymax-ymin)*t/4; var py=Y(yy);
-      ctx.strokeStyle="#eef2f7"; ctx.beginPath(); ctx.moveTo(padL,py); ctx.lineTo(W-padR,py); ctx.stroke();
-      ctx.fillStyle="#94a3b8"; ctx.fillText(yy.toFixed(1), 8, py+3); }
-    ctx.fillStyle="#475569"; ctx.fillText("Concentration (pg/mL, log)", W/2-70, H-6);
-    // fitted curve
-    ctx.strokeStyle="#2563eb"; ctx.lineWidth=2; ctx.beginPath();
-    var n=120, started=false;
-    for(var i=0;i<=n;i++){ var lx=xmin+(xmax-xmin)*i/n; var conc=Math.pow(10,lx);
-      var yv=Core.fpl([A.params.bottom,A.params.top,A.params.ec50,A.params.hill],conc);
-      var px2=X(lx), py2=Y(yv);
-      if(!started){ctx.moveTo(px2,py2);started=true;} else ctx.lineTo(px2,py2);
-    }
-    ctx.stroke();
-    // std points
-    ctx.fillStyle="#1e293b";
-    stds.forEach(function(r){ var px=X(Math.log10(r.nominal)), py=Y(r.meanOd);
-      ctx.beginPath(); ctx.arc(px,py,3.5,0,2*Math.PI); ctx.fill(); });
+    var xs=stds.map(function(r){return Math.log10(r.nominal);});
+    var xmin=Math.min.apply(null,xs),xmax=Math.max.apply(null,xs);
+    var ymax=Math.max(Math.max.apply(null,stds.map(function(r){return r.meanOd;}))*1.1, 0.1), ymin=0;
+    function X(lx){return padL+(lx-xmin)/(xmax-xmin)*(W-padL-padR);}
+    function Y(y){return H-padB-(y-ymin)/(ymax-ymin)*(H-padT-padB);}
+    ctx.strokeStyle="#cbd5e1";ctx.beginPath();ctx.moveTo(padL,padT);ctx.lineTo(padL,H-padB);ctx.lineTo(W-padR,H-padB);ctx.stroke();
+    ctx.font="11px system-ui";
+    for(var d=Math.floor(xmin);d<=Math.ceil(xmax);d++){var px=X(d);if(px<padL-1||px>W-padR+1)continue;ctx.strokeStyle="#eef2f7";ctx.beginPath();ctx.moveTo(px,padT);ctx.lineTo(px,H-padB);ctx.stroke();ctx.fillStyle="#94a3b8";ctx.fillText(Math.pow(10,d).toLocaleString(),px-10,H-padB+14);}
+    for(var t=0;t<=4;t++){var yy=ymin+(ymax-ymin)*t/4,py=Y(yy);ctx.strokeStyle="#eef2f7";ctx.beginPath();ctx.moveTo(padL,py);ctx.lineTo(W-padR,py);ctx.stroke();ctx.fillStyle="#94a3b8";ctx.fillText(yy.toFixed(1),8,py+3);}
+    ctx.strokeStyle="#2563eb";ctx.lineWidth=2;ctx.beginPath();var started=false;
+    for(var i=0;i<=120;i++){var lx=xmin+(xmax-xmin)*i/120;var conc=Math.pow(10,lx);var yv=Core.fpl([A.params.bottom,A.params.top,A.params.ec50,A.params.hill],conc);var px2=X(lx),py2=Y(yv);if(!started){ctx.moveTo(px2,py2);started=true;}else ctx.lineTo(px2,py2);}
+    ctx.stroke();ctx.lineWidth=1;ctx.fillStyle="#1e293b";
+    stds.forEach(function(r){var px=X(Math.log10(r.nominal)),py=Y(r.meanOd);ctx.beginPath();ctx.arc(px,py,3.5,0,2*Math.PI);ctx.fill();});
+  }
+
+  function render(){
+    var nPK=analyses.filter(function(a){return a.analysis.mode!=="doseresponse";}).length;
+    var nDR=analyses.filter(function(a){return a.analysis.mode==="doseresponse";}).length;
+    $('resultSummary').textContent = analyses.length+" sheet"+(analyses.length>1?"s":"")+" analyzed"+(nDR?" ("+nDR+" dose-response)":"");
+    var host=$('sheets'); host.innerHTML="";
+    analyses.forEach(function(item,idx){
+      var A=item.analysis;
+      var panel=document.createElement('div'); panel.className='panel';
+      var cid='curve_'+idx;
+      var degen = A.params.ec50>1e6 || A.params.top>50;
+      var html="<h3 style='margin-top:0'>"+esc(item.sheetName)+(A.analyte?" — "+esc(A.analyte):"")+(A.mode==="doseresponse"?" · dose-response":"")+"</h3>";
+      html+="<div class='kpis'>"+kpi("EC50 (pg/mL)",fmt(A.params.ec50, A.params.ec50>1000?0:1))+kpi("Hill",fmt(A.params.hill,3))+kpi("R²",fmt(A.r2,4))+kpi("LLOQ–ULOQ",fmt(A.lloq,1)+"–"+fmt(A.uloq,0))+(A.dilution&&A.dilution!==1?kpi("Dilution","×"+A.dilution):"")+"</div>";
+      if(degen) html+="<div class='foot' style='color:#b45309'>Note: standard curve has no sampled upper plateau — fit is ill-conditioned (large EC50/Top). Interpolation near the top/bottom may be uncertain.</div>";
+      html+="<canvas id='"+cid+"' width='640' height='280'></canvas>";
+      html+="<h3>Standard curve</h3>"+odTable(A.standards,"standard",A);
+      if(A.qcs&&A.qcs.length){ html+="<h3>Quality controls</h3>"+odTable(A.qcs,"standard",A); }
+      if(A.samples&&A.samples.length){ html+="<h3>Samples</h3>"+odTable(A.samples,"sample",A); }
+      if(A.compounds&&A.compounds.length){
+        html+="<h3>IC50 summary</h3><div class='tablewrap'><table><thead><tr><th>Compound</th><th>IC50 (nM)</th><th>Hill</th><th>Curve R²</th></tr></thead><tbody>";
+        A.compounds.forEach(function(c){ html+="<tr><td class='lab'>"+esc(c.label)+"</td><td>"+(typeof c.ic50Display==="number"?fmt(c.ic50Display,2):esc(c.ic50Display||"NA"))+"</td><td>"+(c.fit?fmt(c.fit.hill,2):"")+"</td><td>"+(c.fit?fmt(c.fit.r2,3):"")+"</td></tr>"; });
+        html+="</tbody></table></div>";
+        A.compounds.forEach(function(c){ html+="<h3 style='font-weight:600'>"+esc(c.label)+"</h3>"+odTable(c.rows,"dose",A); });
+      }
+      panel.innerHTML=html; host.appendChild(panel);
+      drawCurve($(cid),A);
+    });
   }
 
   function download(){
-    if(!lastAnalysis || !originalWB) return;
-    var wb = Writer.appendSummary(XLSX, originalWB, lastAnalysis, lastName+".xlsx");
-    var out = XLSX.write(wb,{type:'array',bookType:'xlsx'});
-    var blob = new Blob([out],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-    var link=document.createElement('a');
-    link.href=URL.createObjectURL(blob); link.download=lastName+"_analyzed.xlsx";
+    if(!analyses.length||!originalWB) return;
+    Writer.appendSummaries(XLSX, originalWB, analyses, lastName+".xlsx");
+    var out=XLSX.write(originalWB,{type:'array',bookType:'xlsx'});
+    var blob=new Blob([out],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    var link=document.createElement('a'); link.href=URL.createObjectURL(blob); link.download=lastName+"_analyzed.xlsx";
     document.body.appendChild(link); link.click(); document.body.removeChild(link);
     setTimeout(function(){URL.revokeObjectURL(link.href);},1500);
   }
 
-  // wire up
-  window.addEventListener('DOMContentLoaded', function(){
-    var dz=$('drop'), fi=$('file');
-    dz.addEventListener('click', function(){ fi.click(); });
-    fi.addEventListener('change', function(e){ if(e.target.files[0]) handleFile(e.target.files[0]); });
-    ['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev,function(e){e.preventDefault();dz.classList.add('over');});});
-    ['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev,function(e){e.preventDefault();dz.classList.remove('over');});});
-    dz.addEventListener('drop', function(e){ var f=e.dataTransfer.files[0]; if(f) handleFile(f); });
-    $('dil').addEventListener('input', run);
-    $('unit').addEventListener('change', run);
-    $('downloadBtn').addEventListener('click', download);
+  window.addEventListener('DOMContentLoaded',function(){
+    var dz=$('drop'),fi=$('file');
+    dz.addEventListener('click',function(){fi.click();});
+    fi.addEventListener('change',function(e){ if(e.target.files[0]) handleFile(e.target.files[0]); });
+    ['dragenter','dragover'].forEach(function(ev){dz.addEventListener(ev,function(e){e.preventDefault();dz.classList.add('over');});});
+    ['dragleave','drop'].forEach(function(ev){dz.addEventListener(ev,function(e){e.preventDefault();dz.classList.remove('over');});});
+    dz.addEventListener('drop',function(e){var f=e.dataTransfer.files[0];if(f)handleFile(f);});
+    $('dil').addEventListener('input',run); $('unit').addEventListener('change',run);
+    $('downloadBtn').addEventListener('click',download);
   });
 })();
 </script>
